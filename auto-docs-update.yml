@@ -1,0 +1,357 @@
+name: Auto Documentation Update
+
+# =============================================================================
+# USAGE & SETUP
+# =============================================================================
+# 1. Place this file in: .github/workflows/auto-docs-update.yml
+#
+# 2. Required GitHub Secrets:
+#    - LLM_API_KEY: Your LLM API key (e.g., OpenAI, Anthropic, etc.)
+#
+# 3. Expected backend.py CLI interface:
+#    python backend.py --base-branch <branch> --docs-path <path> --output <json_file>
+#    The script should:
+#    - Analyze diffs against base-branch
+#    - Call LLM API using LLM_API_KEY env var
+#    - Write updated docs to disk under docs-path
+#    - Output JSON to the specified output file with structure:
+#      {
+#        "pr_branch": "auto-docs/update-YYYY-MM-DD-HHMM",
+#        "pr_title": "📘 Auto-update docs: ...",
+#        "pr_body": "Markdown PR body...",
+#        "files_changed": ["docs/file1.md", ...],
+#        "created_changes": true/false
+#      }
+#
+# 4. Manual trigger example:
+#    workflow_dispatch:
+#      base_branch: main
+#      docs_path: docs
+#      force: false
+#
+# 5. Customization:
+#    - Modify the 'paths' arrays below to change which file changes trigger the workflow
+#    - Adjust Python version in setup-python step
+#    - Modify docs_path default in workflow_dispatch inputs
+# =============================================================================
+
+on:
+  push:
+    branches:
+      - '**'  # Trigger on push to any branch
+    paths:
+      # Configurable: Add/remove paths that should trigger doc updates
+      - 'src/**'
+      - 'app/**'
+      - 'public/**'
+      - 'frontend/**'
+      - 'package.json'
+      - 'pyproject.toml'
+      - 'requirements.txt'
+      - 'docs/**'
+
+  pull_request:
+    branches:
+      - '**'  # Trigger on PRs targeting any branch
+    paths:
+      # Same paths as push trigger
+      - 'src/**'
+      - 'app/**'
+      - 'public/**'
+      - 'frontend/**'
+      - 'package.json'
+      - 'pyproject.toml'
+      - 'requirements.txt'
+      - 'docs/**'
+
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: 'Base branch to compare against (default: main)'
+        required: false
+        default: 'main'
+        type: string
+      docs_path:
+        description: 'Path to documentation directory (default: docs)'
+        required: false
+        default: 'docs'
+        type: string
+      force:
+        description: 'Force PR creation even if no changes detected (for testing)'
+        required: false
+        default: 'false'
+        type: boolean
+
+# Prevent overlapping runs on the same branch
+concurrency:
+  group: doc-update-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege permissions
+permissions:
+  contents: write  # Required to push commits and create PRs
+  actions: read   # Required to read workflow status
+
+jobs:
+  update-docs:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history needed for diff analysis
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install Python dependencies
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "⚠️  No requirements.txt found, skipping dependency installation"
+          fi
+
+      - name: Configure Git identity
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Determine base branch
+        id: base_branch
+        run: |
+          BASE_BRANCH="${{ inputs.base_branch || 'main' }}"
+          echo "base_branch=${BASE_BRANCH}" >> $GITHUB_OUTPUT
+          echo "📌 Using base branch: ${BASE_BRANCH}"
+
+      - name: Show changed files summary
+        run: |
+          echo "📋 Changed files summary:"
+          echo "=========================="
+          if git diff --name-only origin/${{ steps.base_branch.outputs.base_branch }}...HEAD 2>/dev/null | head -20; then
+            echo ""
+            echo "Total files changed: $(git diff --name-only origin/${{ steps.base_branch.outputs.base_branch }}...HEAD 2>/dev/null | wc -l)"
+          else
+            echo "No diff available (may be first commit or branch doesn't exist)"
+          fi
+
+      - name: Run backend script to update documentation
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          set -e  # Exit on error
+          echo "🚀 Running backend.py to analyze changes and update docs..."
+          
+          BASE_BRANCH="${{ steps.base_branch.outputs.base_branch }}"
+          DOCS_PATH="${{ inputs.docs_path || 'docs' }}"
+          OUTPUT_FILE="/tmp/auto_docs_result.json"
+          
+          python backend.py \
+            --base-branch "${BASE_BRANCH}" \
+            --docs-path "${DOCS_PATH}" \
+            --output "${OUTPUT_FILE}"
+          
+          echo "✅ backend.py completed successfully"
+          
+          # Verify output file exists
+          if [ ! -f "${OUTPUT_FILE}" ]; then
+            echo "❌ Error: backend.py did not create output file ${OUTPUT_FILE}"
+            exit 1
+          fi
+          
+          echo "📄 Output file created: ${OUTPUT_FILE}"
+
+      - name: Parse backend output
+        id: backend_output
+        run: |
+          OUTPUT_FILE="/tmp/auto_docs_result.json"
+          
+          if [ ! -f "${OUTPUT_FILE}" ]; then
+            echo "❌ Error: Output file not found"
+            exit 1
+          fi
+          
+          # Extract values from JSON (using jq if available, otherwise Python)
+          if command -v jq &> /dev/null; then
+            PR_BRANCH=$(jq -r '.pr_branch // "auto-docs/update-unknown"' "${OUTPUT_FILE}")
+            PR_TITLE=$(jq -r '.pr_title // "📘 Auto-update docs"' "${OUTPUT_FILE}")
+            PR_BODY=$(jq -r '.pr_body // "Auto-generated documentation update"' "${OUTPUT_FILE}")
+            FILES_CHANGED=$(jq -r '.files_changed | join(", ")' "${OUTPUT_FILE}")
+            CREATED_CHANGES=$(jq -r '.created_changes // false' "${OUTPUT_FILE}")
+          else
+            # Fallback to Python for JSON parsing
+            PR_BRANCH=$(python3 -c "import json; d=json.load(open('${OUTPUT_FILE}')); print(d.get('pr_branch', 'auto-docs/update-unknown'))")
+            PR_TITLE=$(python3 -c "import json; d=json.load(open('${OUTPUT_FILE}')); print(d.get('pr_title', '📘 Auto-update docs'))")
+            PR_BODY=$(python3 -c "import json; d=json.load(open('${OUTPUT_FILE}')); print(d.get('pr_body', 'Auto-generated documentation update'))")
+            FILES_CHANGED=$(python3 -c "import json; d=json.load(open('${OUTPUT_FILE}')); print(', '.join(d.get('files_changed', [])))")
+            CREATED_CHANGES=$(python3 -c "import json; d=json.load(open('${OUTPUT_FILE}')); print(d.get('created_changes', False))")
+          fi
+          
+          echo "pr_branch=${PR_BRANCH}" >> $GITHUB_OUTPUT
+          echo "pr_title<<EOF" >> $GITHUB_OUTPUT
+          echo "${PR_TITLE}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "pr_body<<EOF" >> $GITHUB_OUTPUT
+          echo "${PR_BODY}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "files_changed=${FILES_CHANGED}" >> $GITHUB_OUTPUT
+          echo "created_changes=${CREATED_CHANGES}" >> $GITHUB_OUTPUT
+          
+          echo "📊 Backend output parsed:"
+          echo "  - PR Branch: ${PR_BRANCH}"
+          echo "  - PR Title: ${PR_TITLE}"
+          echo "  - Files Changed: ${FILES_CHANGED}"
+          echo "  - Created Changes: ${CREATED_CHANGES}"
+
+      - name: Check for documentation changes
+        id: check_changes
+        run: |
+          DOCS_PATH="${{ inputs.docs_path || 'docs' }}"
+          FORCE="${{ inputs.force || 'false' }}"
+          CREATED_CHANGES="${{ steps.backend_output.outputs.created_changes }}"
+          
+          # Check if there are actual file changes in the docs directory
+          if [ -d "${DOCS_PATH}" ]; then
+            CHANGES=$(git status --porcelain "${DOCS_PATH}/" 2>/dev/null | wc -l || echo "0")
+          else
+            CHANGES="0"
+          fi
+          
+          if [ "${CREATED_CHANGES}" = "true" ] || [ "${FORCE}" = "true" ]; then
+            if [ "${CHANGES}" -gt 0 ] || [ "${FORCE}" = "true" ]; then
+              echo "✅ Documentation changes detected or force mode enabled"
+              echo "should_create_pr=true" >> $GITHUB_OUTPUT
+            else
+              echo "⚠️  Backend reported changes but no files modified in ${DOCS_PATH}"
+              echo "should_create_pr=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "ℹ️  No documentation changes detected — nothing to commit"
+            echo "should_create_pr=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create branch and commit changes
+        if: steps.check_changes.outputs.should_create_pr == 'true'
+        run: |
+          PR_BRANCH="${{ steps.backend_output.outputs.pr_branch }}"
+          DOCS_PATH="${{ inputs.docs_path || 'docs' }}"
+          
+          echo "🌿 Creating branch: ${PR_BRANCH}"
+          
+          # Create or checkout the branch
+          git checkout -b "${PR_BRANCH}" 2>/dev/null || git checkout "${PR_BRANCH}"
+          
+          # Only add files under docs_path to avoid committing unrelated changes
+          if [ -d "${DOCS_PATH}" ]; then
+            git add "${DOCS_PATH}/"
+          else
+            echo "⚠️  Warning: Docs directory ${DOCS_PATH} not found"
+            exit 1
+          fi
+          
+          # Check if there are staged changes
+          if ! git diff --staged --quiet; then
+            echo "💾 Committing documentation changes..."
+            git commit -m "📘 Auto-update documentation
+
+            Automated documentation update generated by GitHub Actions.
+            
+            Files changed:
+            ${{ steps.backend_output.outputs.files_changed }}"
+            
+            echo "✅ Changes committed successfully"
+          else
+            echo "⚠️  No staged changes to commit"
+            exit 1
+          fi
+          
+          # Push the branch
+          echo "📤 Pushing branch to remote..."
+          git push origin "${PR_BRANCH}" || {
+            echo "❌ Failed to push branch. This may happen if the branch already exists."
+            echo "💡 Tip: The backend script should generate unique branch names (e.g., with timestamps)"
+            exit 1
+          }
+          
+          echo "✅ Branch pushed successfully"
+
+      - name: Create Pull Request
+        if: steps.check_changes.outputs.should_create_pr == 'true'
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          head: ${{ steps.backend_output.outputs.pr_branch }}
+          base: ${{ steps.base_branch.outputs.base_branch }}
+          title: ${{ steps.backend_output.outputs.pr_title }}
+          body: ${{ steps.backend_output.outputs.pr_body }}
+          commit-message: "📘 Auto-update documentation"
+          labels: |
+            documentation
+            automated
+          draft: false
+          delete-branch: false
+
+      - name: Output PR information
+        if: steps.check_changes.outputs.should_create_pr == 'true'
+        run: |
+          echo "🎉 Pull Request created successfully!"
+          echo "📝 PR Title: ${{ steps.backend_output.outputs.pr_title }}"
+          echo "📁 Files Changed: ${{ steps.backend_output.outputs.files_changed }}"
+          echo ""
+          echo "💡 View the PR in the GitHub UI to review and merge the documentation updates."
+
+      - name: Run tests (optional)
+        continue-on-error: true
+        run: |
+          if [ -d "tests" ] && [ -f "requirements.txt" ]; then
+            echo "🧪 Running tests..."
+            python -m pytest -q || {
+              echo "⚠️  Tests failed, but continuing workflow (non-blocking)"
+              exit 0
+            }
+          else
+            echo "⏭️  Skipping tests (tests/ directory not found or no requirements.txt)"
+          fi
+
+      - name: Upload backend output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: auto-docs-result
+          path: /tmp/auto_docs_result.json
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Final status message
+        if: steps.check_changes.outputs.should_create_pr != 'true'
+        run: |
+          echo "✅ Workflow completed successfully"
+          echo "ℹ️  No documentation changes were needed — everything is up to date!"
+          echo ""
+          echo "💡 To force a PR creation for testing, use workflow_dispatch with force: true"
+
+      - name: Error handling
+        if: failure()
+        run: |
+          echo "❌ Workflow failed. Please check the logs above for details."
+          echo ""
+          echo "🔧 Troubleshooting tips:"
+          echo "  1. Verify LLM_API_KEY secret is set in repository settings"
+          echo "  2. Check that backend.py exists and is executable"
+          echo "  3. Ensure backend.py outputs valid JSON to the specified output file"
+          echo "  4. Review backend.py logs for LLM API errors"
+          echo "  5. Try running manually via workflow_dispatch to debug"
+          echo ""
+          echo "🔄 To retry, use workflow_dispatch from the Actions tab"
+
