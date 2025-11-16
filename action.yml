@@ -24,8 +24,8 @@ runs:
         python-version: "3.10"
 
     - name: Install dependencies
-      run: pip install -r ${{ github.action_path }}/requirements.txt
-      shell: bash
+  run: pip install -r ${{ github.action_path }}/requirements.txt
+  shell: bash
 
     - name: Run auto-doc engine
       env:
