@@ -1,0 +1,39 @@
+name: "Auto Documentation Agent"
+description: "Automatically updates documentation using LLMs based on code changes"
+author: "vjCodeMaze"
+branding:
+  icon: "book-open"
+  color: "blue"
+
+inputs:
+  llm_api_key:
+    description: "Your LLM API key (OpenAI / Gemini / etc.)"
+    required: true
+
+  llm_model:
+    description: "Model to use (e.g., gpt-4o-mini, gemini-1.5-flash)"
+    required: false
+    default: "gpt-4o-mini"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.10"
+
+    - name: Install dependencies
+      run: pip install -r requirements.txt
+      shell: bash
+
+    - name: Run backend
+      env:
+        LLM_API_KEY: ${{ inputs.llm_api_key }}
+      run: |
+        python backend.py \
+          --base-branch main \
+          --docs-path docs \
+          --output /tmp/result.json \
+          --llm-model "${{ inputs.llm_model }}"
+      shell: bash
