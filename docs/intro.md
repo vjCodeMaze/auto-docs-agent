@@ -1,7 +1,2 @@
-# Intro
-Initial documentation.
-Auto-doc test change goes here.
+Testing.
 
-## New Features
-
-The application now includes user authentication functionality.
